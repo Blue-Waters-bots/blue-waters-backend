@@ -37,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Function to get Bearer Token from IBM WatsonX
+#  Function to get Bearer Token from IBM WatsonX
 def get_bearer_token():
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = f"grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={API_KEY}"
