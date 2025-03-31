@@ -1,94 +1,109 @@
 from fastapi import FastAPI, HTTPException, Query
 from typing import List, Dict
 from fastapi.middleware.cors import CORSMiddleware
-from models import WaterSource, HistoricalData, QualityPrediction
+from models import WaterSource, HistoricalData, QualityPrediction, Alert
 from data import water_sources, historical_data, quality_predictions
+from pydantic import BaseModel
+import os
+import requests
+from dotenv import load_dotenv
+from datetime import datetime
 
+
+# Load environment variables
+load_dotenv()
+
+API_KEY = os.getenv("WATSONX_API_KEY")
+PROJECT_ID = os.getenv("WATSONX_PROJECT_ID")
+WATSONX_URL = os.getenv("WATSONX_URL")
+IAM_URL = "https://iam.cloud.ibm.com/identity/token"
+WX_API_BASE_URL = "https://api.dataplatform.cloud.ibm.com"
+
+# Initialize FastAPI
 app = FastAPI(
     title="Blue Waters Backend",
     description="Backend for Blue Waters Dashboard",
     version="1.0.0",
 )
 
-# Allow CORS for your frontend URL
-origins = [
-    "http://localhost:8080",  
-]
+# Allow CORS for frontend access
+origins = ["http://127.0.0.1:8080"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"],  
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-water_quality_responses: Dict[str, str] = {
-    "What are the recommended actions if the nitrate level exceeds 10 ppm?": 
-    """If the nitrate level exceeds 10 ppm, the recommended actions depend on the industry:
+# ✅ Function to get Bearer Token from IBM WatsonX
+def get_bearer_token():
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = f"grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={API_KEY}"
     
-    - **Mining**: This is not directly applicable as mining operations typically deal with heavy metals rather than nitrates.
-    - **Water Treatment Plants**: If nitrate levels are high, it may indicate contamination from agricultural runoff or sewage. Additional filtration methods, such as reverse osmosis or ion exchange, may be necessary to reduce nitrate levels.
-    - **Water Utilities**: High nitrate levels can pose a risk to public health, especially for infants. The utility should consider implementing additional treatment processes, such as biological nitrification/denitrification, ion exchange, or reverse osmosis.
-    - **Agriculture**: High nitrate levels in irrigation water can lead to excessive plant growth and potential toxicity in crops. Recommendations include switching to alternative water sources, implementing proper irrigation practices, and possibly using nitrate-reducing bacteria to lower nitrate levels.
+    response = requests.post(IAM_URL, headers=headers, data=data,timeout=(20, 60) )
     
-    In all cases, it's crucial to identify the source of the high nitrate levels and address it to prevent future contamination.""",
+    if response.status_code == 200:
+        token = response.json().get("access_token")
+        print("Bearer Token:", token)  # Print the token for debugging
+        return token
+    else:
+        print("Authentication Error:", response.status_code, response.text)  # Print error details
+        raise HTTPException(status_code=500, detail="Failed to authenticate with WatsonX")
 
-    "Is water with 20 mg/L nitrate safe to drink?": 
-    """Water with 20 mg/L nitrate does not meet the EPA's maximum contaminant level (MCL) for nitrate, which is 10 mg/L for drinking water. 
-    High nitrate levels can pose health risks, particularly for infants under six months old, as nitrate can convert to nitrite in the stomach, potentially leading to methemoglobinemia, also known as blue baby syndrome.""",
 
-    "Our water has a dissolved oxygen level of 2 mg/L. Is this acceptable for mining operations?":
-    """The acceptable dissolved oxygen level for mining operations can vary depending on the specific mining process and the type of minerals being extracted. However, generally, dissolved oxygen levels below 5 mg/L can indicate poor water quality and potential issues with aquatic life or corrosion in mining equipment."""
-}
+def query_watsonx(prompt: str):
+    """Query WatsonX AI model with a given prompt dynamically."""
+    token = get_bearer_token()  # Make sure this function returns a valid token
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
 
-health_risk_responses: Dict[str, str] = {
-    "What are the health risks of consuming water with high arsenic levels?": 
-    """Long-term exposure to high arsenic levels in drinking water can cause serious health problems, including:
-    
-    - **Cancer**: Increased risk of bladder, lung, and skin cancer.
-    - **Skin Lesions**: Thickening and dark spots on the skin.
-    - **Cardiovascular Issues**: Increased risk of high blood pressure and heart disease.
-    - **Neurological Effects**: Can lead to memory problems and impaired cognitive function.
-    - **Developmental Issues**: Children exposed to arsenic may experience developmental problems.
+    payload = {
+        "model_id": "ibm/granite-3-8b-instruct",
+        "project_id": PROJECT_ID,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a water quality monitoring assistant. Your job is to analyze water parameters based on EPA standards and provide recommendations."
+            },
+            {
+                "role": "user",
+                "content": prompt  # Directly pass the user query as content
+            }
+        ],
+        "max_tokens": 70,
+        "temperature": 0.3,
+        "time_limit": 1000
+    }
 
-    The EPA's maximum contaminant level (MCL) for arsenic in drinking water is **0.010 mg/L**. If arsenic levels exceed this limit, consider installing an **arsenic filtration system** or switching to a **safer water source**.""",
+    try:
+        response = requests.post(f"{WATSONX_URL}/ml/v1/text/chat?version=2023-10-25", json=payload, headers=headers, timeout=300)
+        response.raise_for_status()  # Will raise an HTTPError for bad responses
 
-    "How does high lead contamination in water affect health?": 
-    """Lead contamination in drinking water can have severe health effects, especially for children and pregnant women. Health risks include:
-    
-    - **Neurological Damage**: Lead exposure can impair brain development in children, leading to learning disabilities and reduced IQ.
-    - **Kidney Damage**: Long-term exposure can cause kidney failure.
-    - **High Blood Pressure**: Lead can contribute to cardiovascular diseases.
-    - **Behavioral Issues**: Children exposed to lead may experience hyperactivity, aggression, and attention disorders.
+        # Log or print the response for debugging
+        print(response.json())
 
-    The EPA's action level for lead in drinking water is **0.015 mg/L**. If water tests show lead contamination, consider **installing lead-removing filters**, replacing old lead pipes, and **flushing taps before use**.""",
+        # Safely extract the AI's response from the "choices" list
+        choices = response.json().get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "No response from AI.")
+        else:
+            return "No response from AI."
+    except requests.exceptions.RequestException as e:
+        # Handle HTTP or connection errors
+        raise HTTPException(status_code=500, detail=f"Request failed: {e}")
 
-    "What are the symptoms of nitrate poisoning from drinking water?":
-    """Nitrate poisoning, also known as methemoglobinemia or "blue baby syndrome," can occur when infants consume water with high nitrate levels (above 10 mg/L). Symptoms include:
-    
-    - **Bluish skin color (cyanosis)**, especially around the mouth and fingertips.
-    - **Difficulty breathing** and shortness of breath.
-    - **Fatigue, dizziness, and headaches** due to reduced oxygen levels in the blood.
-    - **Rapid heartbeat**.
-    - **Loss of consciousness in severe cases**.
 
-    If you suspect nitrate poisoning, seek **immediate medical attention** and switch to **low-nitrate drinking water** (e.g., bottled or treated water).""",
-
-    "I have water with high ph is safe for my cows?":
-    """High pH levels in water can affect the health of your cows. While high pH levels do not directly cause immediate harm like high levels of contaminants such as arsenic, nitrates, or lead, they can still have indirect effects on your cattle's health and productivity.
-
-Reduced water intake: Cows prefer water with a pH between 6.0 and 7.0. Water with a high pH (above 7.0) can taste bitter, leading to reduced water intake. This can result in dehydration, which can negatively impact milk production and overall health.
-Mineral imbalances: High pH water can lead to mineral imbalances in the cows' bodies. For example, high pH water can cause an increase in sodium and a decrease in calcium and magnesium absorption, which can affect bone health and milk production.
-Urinary issues: High pH urine can lead to the formation of struvite (magnesium ammonium phosphate) stones in the urinary tract, causing discomfort and potential blockages.
-To ensure the health of your cows, it is recommended to test the water regularly and, if necessary, implement measures to adjust the pH levels. This can be done by adding small amounts of an acid, such as sulfuric or hydrochloric acid, to lower the pH. However, it is crucial to consult with a livestock expert or a water quality specialist before making any adjustments to ensure the safety and effectiveness of the process."""
-}
-
+# 📌 GET Water Sources
 @app.get("/water-sources", response_model=List[WaterSource])
 async def get_water_sources():
     return water_sources
 
+# 📌 GET Specific Water Source by ID
 @app.get("/water-source/{source_id}", response_model=WaterSource)
 async def get_water_source_by_id(source_id: str):
     source = next((source for source in water_sources if source.id == source_id), None)
@@ -96,10 +111,12 @@ async def get_water_source_by_id(source_id: str):
         raise HTTPException(status_code=404, detail="Water source not found")
     return source
 
+# 📌 GET Historical Data
 @app.get("/historical-data", response_model=List[HistoricalData])
 async def get_historical_data():
     return historical_data
 
+# 📌 GET Quality Prediction by Source ID
 @app.get("/quality-predictions/{source_id}", response_model=QualityPrediction)
 async def get_quality_prediction(source_id: str):
     prediction = quality_predictions.get(source_id)
@@ -107,15 +124,101 @@ async def get_quality_prediction(source_id: str):
         raise HTTPException(status_code=404, detail="Prediction not found")
     return prediction
 
-# Simulate AI Agent Responses
-@app.get("/simulate-water-quality-agent")
-async def simulate_water_quality_agent(query: str = Query(..., description="Enter your query related to water quality")):
-    response = water_quality_responses.get(query, "I'm sorry, I don't have an answer for that.")
-    return {"response": response}
+# 📌 GET Alerts
+@app.get("/alerts", response_model=List[Alert])
+async def get_alerts():
+    # Fetch the latest water sources data
+    alerts = []
+    for source in water_sources:
+        # Check each source for water quality alerts and health risks
+        water_quality_alerts = check_water_quality_alerts(source)
+        health_risk_alerts = check_health_risk_alerts(source)
+        
+        alerts.extend(water_quality_alerts)
+        alerts.extend(health_risk_alerts)
 
-# Simulate Health Advisory Agent
-@app.get("/simulate-health-risk-agent")
-async def simulate_health_risk_agent(query: str = Query(..., description="Enter your query related to health risks")):
-    response = health_risk_responses.get(query, "I'm sorry, I don't have an answer for that.")
-    return {"response": response}
+    return alerts
 
+
+# Function to check water quality and generate alerts
+def check_water_quality_alerts(source: WaterSource) -> List[Alert]:
+    alerts = []
+    for metric in source.metrics:
+        if metric.status == "danger":
+            ai_advice = query_watsonx(f"Provide advice for high {metric.name} level ({metric.value} {metric.unit})")
+            alert = Alert(
+                message=f"{metric.name} is {metric.value} {metric.unit}, which is outside the safe range. Blue Waters AI Advice: {ai_advice}",
+                source=source.name,
+                level="critical",
+                metric=metric.name,
+                value=metric.value,
+                unit=metric.unit,
+                timestamp=datetime.now(),
+            )
+            alerts.append(alert)
+        elif metric.status == "warning":
+            ai_advice = query_watsonx(f"Provide advice for warning {metric.name} level ({metric.value} {metric.unit})")
+            alert = Alert(
+                message=f"{metric.name} is approaching unsafe levels, currently {metric.value} {metric.unit}. Blue Waters AI Advice: {ai_advice}",
+                source=source.name,
+                level="warning",
+                metric=metric.name,
+                value=metric.value,
+                unit=metric.unit,
+                timestamp=datetime.now(),
+            )
+            alerts.append(alert)
+    return alerts
+
+
+# Function to check health risks and generate alerts
+def check_health_risk_alerts(source: WaterSource) -> List[Alert]:
+    alerts = []
+    for disease in source.diseases:
+        if disease.riskLevel == "high":
+            ai_advice = query_watsonx(f"Provide advice for high health risk from {disease.name}")
+            alert = Alert(
+                message=f"Health risk: {disease.name}. This water source poses a high health risk due to {', '.join(disease.causedBy)}. Blue Waters AI Advice: {ai_advice}",
+                source=source.name,
+                level="critical",
+                metric=disease.name,
+                value=0,  # Health risk is not a direct value, but a general alert
+                unit="",
+                timestamp=datetime.now(),
+            )
+            alerts.append(alert)
+        elif disease.riskLevel == "medium":
+            ai_advice = query_watsonx(f"Provide advice for medium health risk from {disease.name}")
+            alert = Alert(
+                message=f"Health risk: {disease.name}. Moderate health risk detected. Take necessary precautions. Blue Waters AI Advice: {ai_advice}",
+                source=source.name,
+                level="warning",
+                metric=disease.name,
+                value=0,
+                unit="",
+                timestamp=datetime.now(),
+            )
+            alerts.append(alert)
+    return alerts
+
+
+# ✅ AI Agent for Water Quality Advisory (WatsonX Integration)
+@app.get("/water-quality-agent")
+async def water_quality_agent(query: str = Query(..., description="Enter your query related to water quality")):
+    """AI-powered water quality advisory"""
+    ai_response = query_watsonx(query)
+    return {"response": ai_response}
+
+
+# ✅ AI Agent for Health Risk Advisory (WatsonX Integration)
+@app.get("/health-risk-agent")
+async def health_risk_agent(query: str = Query(..., description="Enter your query related to health risks")):
+    """AI-powered health risk advisory"""
+    ai_response = query_watsonx(query)
+    return {"response": ai_response}
+
+# ✅ WatsonX Credentials for Reference (Not used directly in API calls)
+credentials = {
+    "url": WATSONX_URL,
+    "apikey": API_KEY,  
+}
